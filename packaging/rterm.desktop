@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=rterm
+GenericName=Terminal
+Comment=iTerm2-style terminal with tabs, split panes and shell integration
+Exec=rterm
+Icon=rterm
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=shell;prompt;command;commandline;terminal;iterm;
+StartupNotify=true
+StartupWMClass=rterm
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=rterm

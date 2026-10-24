@@ -1,0 +1,62 @@
+# Versioning: release-please reads Conventional Commits on main and keeps a "chore(main): release x.y.z"
+# PR open that bumps Cargo.toml/Cargo.lock and CHANGELOG.md. Merging it tags vX.Y.Z, creates the GitHub
+# release, and the build job below attaches the .deb packages to it.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      created: ${{ steps.rp.outputs.release_created }}
+      tag: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: rp
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  deb:
+    name: deb (${{ matrix.arch }})
+    needs: release-please
+    if: needs.release-please.outputs.created == 'true'
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-22.04 }
+          - { arch: arm64, runner: ubuntu-22.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+      - run: cargo test --locked
+      - run: cargo deb --locked --profile dist
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag }}
+        run: |
+          cd target/debian
+          for deb in *.deb; do sha256sum "$deb" > "$deb.sha256"; done
+          gh release upload "$TAG" *.deb *.deb.sha256 --clobber --repo "$GITHUB_REPOSITORY"

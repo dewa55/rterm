@@ -1,0 +1,59 @@
+[package]
+name = "rterm"
+version = "0.1.0"
+edition = "2024"
+description = "iTerm2-inspired terminal emulator for Linux: tabs, splits, shell integration"
+license = "MIT"
+repository = "https://github.com/dewa55/rterm"
+readme = "README.md"
+keywords = ["terminal", "terminal-emulator", "iterm2", "egui"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+alacritty_terminal = "0.26.0"
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "wayland", "x11", "clipboard", "default_fonts", "links"] }
+portable-pty = "0.9.0"
+anyhow = "1.0"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
+plist = "1.10.3"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+toml_edit = "0.25"
+
+[profile.release]
+debug = "line-tables-only"
+
+# Used for the .deb packages: no debug info, smaller and faster binary.
+[profile.dist]
+inherits = "release"
+debug = false
+strip = true
+lto = "thin"
+
+# `cargo deb` (https://github.com/kornelski/cargo-deb). winit and glow load the display and GL
+# libraries at runtime, so `$auto` can't see them and they are listed explicitly.
+[package.metadata.deb]
+maintainer = "dewa55 <dewa55@users.noreply.github.com>"
+copyright = "2026, dewa55"
+section = "x11"
+priority = "optional"
+depends = "$auto, fontconfig, libgl1, libegl1, libxkbcommon0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libx11-6, libx11-xcb1, libxkbcommon-x11-0, libxcursor1, libxrandr2, libxi6"
+recommends = "xdg-utils, zenity"
+extended-description = """\
+An iTerm2-inspired terminal emulator for Linux with tabs, split panes, \
+iTerm2-compatible shell integration, find, autocomplete from scrollback \
+and a settings window. Runs on Wayland and X11."""
+assets = [
+    ["target/release/rterm", "usr/bin/", "755"],
+    ["packaging/rterm.desktop", "usr/share/applications/", "644"],
+    ["assets/rterm-16.png", "usr/share/icons/hicolor/16x16/apps/rterm.png", "644"],
+    ["assets/rterm-24.png", "usr/share/icons/hicolor/24x24/apps/rterm.png", "644"],
+    ["assets/rterm-32.png", "usr/share/icons/hicolor/32x32/apps/rterm.png", "644"],
+    ["assets/rterm-48.png", "usr/share/icons/hicolor/48x48/apps/rterm.png", "644"],
+    ["assets/rterm-64.png", "usr/share/icons/hicolor/64x64/apps/rterm.png", "644"],
+    ["assets/rterm-128.png", "usr/share/icons/hicolor/128x128/apps/rterm.png", "644"],
+    ["assets/rterm-256.png", "usr/share/icons/hicolor/256x256/apps/rterm.png", "644"],
+    ["assets/rterm-512.png", "usr/share/icons/hicolor/512x512/apps/rterm.png", "644"],
+    ["README.md", "usr/share/doc/rterm/", "644"],
+    ["config.example.toml", "usr/share/doc/rterm/", "644"],
+]

@@ -1,0 +1,56 @@
+# rterm configuration. Changes are applied as soon as you save this file.
+# Every setting is optional; the values shown are the defaults.
+
+[font]
+# fontconfig family (see `fc-list : family`) or a path to a .ttf/.otf file.
+family = "monospace"
+size = 14.0
+# Multiplier on the font's natural line height.
+line_height = 1.0
+use_bold_font = true
+
+[window]
+theme = "auto"                    # auto | dark | light
+decorations = "iterm"             # iterm (traffic-light title bar) | system
+columns = 80
+rows = 25
+show_tab_bar_with_one_tab = false
+pane_title_bars = true            # per-pane title bar when a tab is split
+dim_inactive_panes = true
+dim_amount = 0.4                  # 0.0 - 1.0
+corner_radius = 10.0
+
+[terminal]
+# shell = "/usr/bin/zsh"          # defaults to $SHELL
+shell_integration = true
+scrollback = 10000
+cursor = "block"                  # block | beam | underline
+copy_on_select = true
+bold_is_bright = true
+mouse_reporting = true            # hold Shift to select text in apps that grab the mouse
+
+[colors]
+# Defaults to iTerm2's "Regular" preset (dark or light variant, following the theme).
+# Any .itermcolors file works, e.g. from https://github.com/mbadolato/iTerm2-Color-Schemes
+# itermcolors = "~/Downloads/Dracula.itermcolors"
+# A multi-preset plist works too; pick one with `preset`:
+# itermcolors = "~/Downloads/iTerm.app/Contents/Resources/ColorPresets.plist"
+# preset = "Solarized Dark"
+#
+# Individual overrides (hex):
+# background = "#15191f"
+# foreground = "#dcdcdc"
+# cursor = "#ffffff"
+# selection = "#b3d7ff"
+# ansi = ["#14191e", "#b43c2a", "#00c200", "#c7c400", "#2744c7", "#c040be", "#00c5c7", "#c7c7c7",
+#         "#686868", "#dd7975", "#58e790", "#ece100", "#a7abf2", "#e17ee1", "#60fdff", "#ffffff"]
+
+[keys]
+# Override or add bindings; "none" passes the key through to the shell.
+# Actions: new_tab close_pane split_vertical split_horizontal focus_left focus_right focus_up
+#   focus_down next_tab prev_tab select_tab_1..select_tab_9 copy paste prev_prompt next_prompt
+#   scroll_page_up scroll_page_down scroll_top scroll_bottom font_bigger font_smaller font_reset
+#   clear_buffer maximize_pane open_settings find find_next find_previous
+#   autocomplete
+# "ctrl+shift+n" = "new_tab"
+# "alt+1" = "none"
