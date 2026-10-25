@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/dewa55/rterm/compare/v0.1.0...v0.2.0) (2026-10-25)
+
+
+### Features
+
+* multiple windows with draggable, renamable, colored tabs ([fae655c](https://github.com/dewa55/rterm/commit/fae655cc902d2c37e8454045cbf45b0705b49568))
+
 ## 0.1.0 (2026-10-24)
 
 
