@@ -349,6 +349,12 @@ impl Config {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Action {
     NewTab,
+    NewWindow,
+    EditTabTitle,
+    MoveTabLeft,
+    MoveTabRight,
+    MoveTabToNewWindow,
+    MergeAllWindows,
     ClosePane,
     Split(Axis),
     Focus(Direction),
@@ -378,6 +384,12 @@ pub enum Action {
 /// Config name, action and menu label for every bindable action.
 pub const ACTIONS: &[(&str, Action, &str)] = &[
     ("new_tab", Action::NewTab, "New Tab"),
+    ("new_window", Action::NewWindow, "New Window"),
+    ("edit_tab_title", Action::EditTabTitle, "Edit Tab Title"),
+    ("move_tab_left", Action::MoveTabLeft, "Move Tab Left"),
+    ("move_tab_right", Action::MoveTabRight, "Move Tab Right"),
+    ("move_tab_to_new_window", Action::MoveTabToNewWindow, "Move Tab to New Window"),
+    ("merge_all_windows", Action::MergeAllWindows, "Merge All Windows"),
     ("close_pane", Action::ClosePane, "Close Pane"),
     ("split_vertical", Action::Split(Axis::Horizontal), "Split Pane Vertically"),
     ("split_horizontal", Action::Split(Axis::Vertical), "Split Pane Horizontally"),
@@ -530,6 +542,10 @@ impl KeyCombo {
 /// iTerm2's Cmd shortcuts mapped to Ctrl+Shift (plain Ctrl keys belong to the shell).
 const DEFAULT_KEYS: &[(&str, &str)] = &[
     ("ctrl+shift+t", "new_tab"),
+    ("ctrl+shift+n", "new_window"),
+    ("ctrl+shift+i", "edit_tab_title"),
+    ("ctrl+shift+pageup", "move_tab_left"),
+    ("ctrl+shift+pagedown", "move_tab_right"),
     ("ctrl+shift+w", "close_pane"),
     ("ctrl+shift+d", "split_vertical"),
     ("ctrl+shift+e", "split_horizontal"),

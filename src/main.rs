@@ -15,6 +15,7 @@ mod shell_integration;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -23,10 +24,11 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
 use eframe::egui::{
     self, Color32, CornerRadius, CursorIcon, Event, EventFilter, FontFamily, FontId, Id, Key, Modifiers,
-    MouseWheelUnit, PointerButton, Rect, Sense, Stroke, StrokeKind, Ui, Vec2, ViewportCommand, pos2, vec2,
+    MouseWheelUnit, PointerButton, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2, ViewportBuilder, ViewportCommand,
+    ViewportId, pos2, vec2,
 };
 
-use chrome::{ChromeColors, PaneTitleAction, TabBarAction, TabInfo};
+use chrome::{ChromeColors, PaneTitleAction, TabBarAction, TabBarState, TabInfo};
 use config::{Action, Bindings, Config, Decorations, Palette, ThemeChoice};
 use input::{MouseAction, MouseButton};
 use layout::{Axis, Direction, Node, PaneId};
@@ -44,20 +46,8 @@ fn main() -> eframe::Result {
         Some(Err(e)) => (Config::default(), Some(e)),
         None => (Config::default(), None),
     };
-    let iterm = config.window.decorations == Decorations::Iterm;
-    // Approximate until the real font metrics are known (corrected on the first frames).
-    let cell = vec2(config.font.size * 0.6, config.font.size * 1.25 * config.font.line_height);
-    let size = render::pane_size_for(config.window.columns, config.window.rows, cell)
-        + vec2(0.0, if iterm { chrome::TITLE_BAR_HEIGHT } else { 0.0 });
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("rterm")
-            .with_app_id("rterm")
-            .with_inner_size(size)
-            .with_min_inner_size([320.0, 200.0])
-            .with_decorations(!iterm)
-            .with_transparent(iterm)
-            .with_icon(app_icon()),
+        viewport: window_builder(&config, Arc::new(app_icon())).with_inner_size(default_window_size(&config)),
         // Ctrl+C/V/X must reach the shell; copy/paste live on Ctrl+Shift+C/V.
         clipboard_shortcuts: false,
         ..Default::default()
@@ -67,6 +57,27 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| Ok(Box::new(App::new(&cc.egui_ctx, config, config_path, error)?))),
     )
+}
+
+/// Settings shared by the main window and the extra windows.
+fn window_builder(config: &Config, icon: Arc<egui::IconData>) -> ViewportBuilder {
+    let iterm = config.window.decorations == Decorations::Iterm;
+    ViewportBuilder::default()
+        .with_title("rterm")
+        .with_app_id("rterm")
+        .with_min_inner_size([320.0, 200.0])
+        .with_decorations(!iterm)
+        .with_transparent(iterm)
+        .with_icon(icon)
+}
+
+/// Columns x rows from the config, approximated until the real font metrics are known
+/// (corrected on the first frames).
+fn default_window_size(config: &Config) -> Vec2 {
+    let iterm = config.window.decorations == Decorations::Iterm;
+    let cell = vec2(config.font.size * 0.6, config.font.size * 1.25 * config.font.line_height);
+    render::pane_size_for(config.window.columns, config.window.rows, cell)
+        + vec2(0.0, if iterm { chrome::TITLE_BAR_HEIGHT } else { 0.0 })
 }
 
 /// The window icon, embedded so the binary works without installed assets.
@@ -79,6 +90,11 @@ fn app_icon() -> egui::IconData {
 }
 
 struct Tab {
+    /// Stable identity while the tab moves between positions and windows.
+    id: u64,
+    /// Title set with Edit Tab Title; the active pane's title otherwise.
+    title: Option<String>,
+    color: Option<Color32>,
     root: Node,
     active: PaneId,
     /// Pane shown alone (iTerm2's "Maximize Active Pane").
@@ -88,8 +104,8 @@ struct Tab {
 }
 
 impl Tab {
-    fn new(id: PaneId) -> Tab {
-        Tab { root: Node::Leaf(id), active: id, zoomed: None, rects: Vec::new() }
+    fn new(id: u64, pane: PaneId) -> Tab {
+        Tab { id, title: None, color: None, root: Node::Leaf(pane), active: pane, zoomed: None, rects: Vec::new() }
     }
 
     fn panes(&self) -> Vec<PaneId> {
@@ -99,10 +115,68 @@ impl Tab {
     }
 }
 
-struct App {
-    panes: HashMap<PaneId, Pane>,
+/// A top-level window with its own tabs. Window 0 is eframe's root viewport; the others are
+/// immediate child viewports drawn during the root's frame, so all windows share one process.
+struct Window {
+    viewport: ViewportId,
     tabs: Vec<Tab>,
     current: usize,
+    /// Exact window size is applied once real font metrics are known.
+    sized: u8,
+    /// Where a window opened by dragging a tab out should appear (ignored on Wayland).
+    position: Option<Pos2>,
+    /// Size from the last frame; a tab moved to a new window keeps it.
+    size: Vec2,
+    /// Screen rects from the last frame, when the platform reports them (not on Wayland).
+    inner_rect: Option<Rect>,
+    outer_rect: Option<Rect>,
+    tab_bar: TabBarState,
+    find: find::Find,
+    autocomplete: autocomplete::Autocomplete,
+    /// Bottom-left of the active pane's cursor cell (anchors the autocomplete popup).
+    cursor_anchor: Option<egui::Pos2>,
+}
+
+impl Window {
+    fn new(viewport: ViewportId, tabs: Vec<Tab>) -> Window {
+        Window {
+            viewport,
+            tabs,
+            current: 0,
+            sized: 0,
+            position: None,
+            size: Vec2::ZERO,
+            inner_rect: None,
+            outer_rect: None,
+            tab_bar: TabBarState::default(),
+            find: find::Find::default(),
+            autocomplete: autocomplete::Autocomplete::new(),
+            cursor_anchor: None,
+        }
+    }
+}
+
+/// A tab dropped outside its window where window positions are unknown (Wayland): it moves to
+/// the window the pointer enters right after the drop, or to a new window if none does.
+struct PendingDrop {
+    tab: u64,
+    source: ViewportId,
+    deadline: Instant,
+}
+
+struct App {
+    panes: HashMap<PaneId, Pane>,
+    windows: Vec<Window>,
+    /// Window whose frame is running; actions apply to it.
+    win: usize,
+    /// Last focused window (target of scripted actions and notices).
+    focused_win: usize,
+    next_window: u64,
+    next_tab: u64,
+    pending_drop: Option<PendingDrop>,
+    /// Set by the script's `quit` so closing the main window doesn't keep other windows alive.
+    quitting: bool,
+    icon: Arc<egui::IconData>,
     next_id: PaneId,
     ctx: egui::Context,
     integration_dir: Option<PathBuf>,
@@ -117,8 +191,6 @@ struct App {
     bindings: Bindings,
     font_size: f32,
     loaded_font: Option<(String, bool)>,
-    /// Exact window size is applied once real font metrics are known.
-    sized_window: u8,
 
     /// Pane receiving the current selection drag.
     selecting: Option<PaneId>,
@@ -127,10 +199,6 @@ struct App {
     notice: Option<(String, Instant)>,
     script: Option<script::Script>,
     settings: settings::Settings,
-    find: find::Find,
-    autocomplete: autocomplete::Autocomplete,
-    /// Bottom-left of the active pane's cursor cell (anchors the autocomplete popup).
-    cursor_anchor: Option<egui::Pos2>,
     /// Settings-window changes are written to the config file shortly after the last edit.
     save_due: Option<Instant>,
 }
@@ -151,8 +219,14 @@ impl App {
         let integration_dir = shell_integration::install_scripts();
         let mut app = App {
             panes: HashMap::new(),
-            tabs: Vec::new(),
-            current: 0,
+            windows: Vec::new(),
+            win: 0,
+            focused_win: 0,
+            next_window: 1,
+            next_tab: 1,
+            pending_drop: None,
+            quitting: false,
+            icon: Arc::new(app_icon()),
             next_id: 1,
             ctx: ctx.clone(),
             integration_dir,
@@ -165,16 +239,12 @@ impl App {
             bindings: Bindings::new(&config.keys),
             font_size: config.font.size,
             loaded_font: None,
-            sized_window: 0,
             config,
             selecting: None,
             mouse_capture: None,
             notice: None,
             script: script::Script::from_env(),
             settings: settings::Settings::new(),
-            find: find::Find::default(),
-            autocomplete: autocomplete::Autocomplete::new(),
-            cursor_anchor: None,
             save_due: None,
         };
         app.apply_config();
@@ -182,7 +252,8 @@ impl App {
             app.notify(format!("Config error: {e}"));
         }
         let id = app.spawn_pane(std::env::current_dir().ok())?;
-        app.tabs.push(Tab::new(id));
+        let tab = app.new_tab_for(id);
+        app.windows.push(Window::new(ViewportId::ROOT, vec![tab]));
         Ok(app)
     }
 
@@ -265,8 +336,27 @@ impl App {
         Ok(id)
     }
 
+    fn new_tab_for(&mut self, pane: PaneId) -> Tab {
+        self.next_tab += 1;
+        Tab::new(self.next_tab, pane)
+    }
+
+    fn w(&self) -> &Window {
+        &self.windows[self.win]
+    }
+
+    fn w_mut(&mut self) -> &mut Window {
+        &mut self.windows[self.win]
+    }
+
     fn active_pane(&self) -> Option<&Pane> {
-        self.panes.get(&self.tabs.get(self.current)?.active)
+        let w = self.w();
+        self.panes.get(&w.tabs.get(w.current)?.active)
+    }
+
+    fn active_id(&self) -> Option<PaneId> {
+        let w = self.w();
+        w.tabs.get(w.current).map(|t| t.active)
     }
 
     fn active_cwd(&self) -> Option<PathBuf> {
@@ -276,19 +366,151 @@ impl App {
     fn new_tab(&mut self) {
         match self.spawn_pane(self.active_cwd()) {
             Ok(id) => {
-                let at = (self.current + 1).min(self.tabs.len());
-                self.tabs.insert(at, Tab::new(id));
-                self.current = at;
+                let tab = self.new_tab_for(id);
+                let w = self.w_mut();
+                let at = (w.current + 1).min(w.tabs.len());
+                w.tabs.insert(at, tab);
+                w.current = at;
             }
             Err(e) => self.notify(format!("Failed to open tab: {e:#}")),
         }
     }
 
-    fn split(&mut self, axis: Axis) {
-        let Some(target) = self.tabs.get(self.current).map(|t| t.active) else { return };
+    fn new_window(&mut self) {
         match self.spawn_pane(self.active_cwd()) {
             Ok(id) => {
-                let tab = &mut self.tabs[self.current];
+                let tab = self.new_tab_for(id);
+                self.open_window(tab, None, None);
+            }
+            Err(e) => self.notify(format!("Failed to open window: {e:#}")),
+        }
+    }
+
+    /// Opens a window holding `tab`, sized like `size` or to the configured columns x rows.
+    fn open_window(&mut self, tab: Tab, position: Option<Pos2>, size: Option<Vec2>) {
+        let viewport = ViewportId::from_hash_of(("rterm-window", self.next_window));
+        self.next_window += 1;
+        let mut window = Window::new(viewport, vec![tab]);
+        window.position = position;
+        if let Some(size) = size {
+            window.size = size;
+            window.sized = 3;
+        }
+        self.windows.push(window);
+        self.focused_win = self.windows.len() - 1;
+        self.ctx.request_repaint();
+    }
+
+    /// Takes tab `index` out of window `win`, keeping a valid current tab.
+    fn remove_tab(&mut self, win: usize, index: usize) -> Tab {
+        let w = &mut self.windows[win];
+        let tab = w.tabs.remove(index);
+        if index < w.current || w.current >= w.tabs.len() {
+            w.current = w.current.saturating_sub(1);
+        }
+        tab
+    }
+
+    /// Moves a tab to another window (at the end) and focuses that window.
+    fn move_tab_to_window(&mut self, from: usize, index: usize, to: usize) {
+        if from == to || index >= self.windows[from].tabs.len() {
+            return;
+        }
+        let tab = self.remove_tab(from, index);
+        let dest = &mut self.windows[to];
+        dest.tabs.push(tab);
+        dest.current = dest.tabs.len() - 1;
+        self.focused_win = to;
+        self.ctx.send_viewport_cmd_to(dest.viewport, ViewportCommand::Focus);
+    }
+
+    /// Moves a tab into a window of its own (iTerm2's Move Tab to New Window).
+    fn detach_tab(&mut self, win: usize, index: usize, position: Option<Pos2>) {
+        if self.windows[win].tabs.len() < 2 || index >= self.windows[win].tabs.len() {
+            return;
+        }
+        let size = self.windows[win].size;
+        let tab = self.remove_tab(win, index);
+        self.open_window(tab, position, (size != Vec2::ZERO).then_some(size));
+    }
+
+    /// Reorders tabs within the current window.
+    fn move_tab(&mut self, from: usize, to: usize) {
+        let w = self.w_mut();
+        if from >= w.tabs.len() || to >= w.tabs.len() {
+            return;
+        }
+        let current = w.tabs[w.current].id;
+        let tab = w.tabs.remove(from);
+        w.tabs.insert(to, tab);
+        w.current = w.tabs.iter().position(|t| t.id == current).unwrap_or(0);
+    }
+
+    /// Moves every tab of the other windows into the current one.
+    fn merge_all_windows(&mut self) {
+        let here = self.win;
+        for other in 0..self.windows.len() {
+            if other != here {
+                let tabs = std::mem::take(&mut self.windows[other].tabs);
+                self.windows[here].tabs.extend(tabs);
+            }
+        }
+    }
+
+    /// A tab dropped outside its window: into the window under the pointer, or a new one.
+    fn drop_tab_outside(&mut self, win: usize, index: usize, pos: Pos2) {
+        let Some(tab) = self.windows[win].tabs.get(index).map(|t| t.id) else { return };
+        let Some(origin) = self.windows[win].inner_rect.map(|r| r.min) else {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            self.pending_drop = Some(PendingDrop { tab, source: self.windows[win].viewport, deadline });
+            return;
+        };
+        let screen = origin + pos.to_vec2();
+        match self.windows.iter().position(|w| w.inner_rect.is_some_and(|r| r.contains(screen))) {
+            Some(target) => self.move_tab_to_window(win, index, target),
+            // Place the new window so the tab bar is under the pointer.
+            None => self.detach_tab(win, index, Some(screen - vec2(60.0, 50.0))),
+        }
+    }
+
+    fn find_tab(&self, id: u64) -> Option<(usize, usize)> {
+        self.windows.iter().enumerate().find_map(|(w, win)| win.tabs.iter().position(|t| t.id == id).map(|t| (w, t)))
+    }
+
+    /// Removes windows without tabs. When the main window empties while others remain, it takes
+    /// over another window's tabs, since closing eframe's root viewport would end the app.
+    fn prune_windows(&mut self, ctx: &egui::Context) {
+        let before = self.windows.len();
+        self.windows.retain(|w| w.viewport == ViewportId::ROOT || !w.tabs.is_empty());
+        if self.windows[0].tabs.is_empty() {
+            if self.windows.len() == 1 {
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+                return;
+            }
+            let mut adopted = self.windows.remove(1);
+            adopted.viewport = ViewportId::ROOT;
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(adopted.size));
+            if let Some(r) = adopted.outer_rect {
+                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(r.min));
+            }
+            self.windows[0] = adopted;
+        }
+        if self.windows.len() != before {
+            self.focused_win = self.focused_win.min(self.windows.len() - 1);
+            ctx.request_repaint();
+        }
+    }
+
+    fn tab_title(&self, tab: &Tab) -> String {
+        tab.title.clone().unwrap_or_else(|| self.pane_title(tab.active))
+    }
+
+    fn split(&mut self, axis: Axis) {
+        let Some(target) = self.active_id() else { return };
+        match self.spawn_pane(self.active_cwd()) {
+            Ok(id) => {
+                let w = self.w_mut();
+                let tab = &mut w.tabs[w.current];
                 tab.root.split(target, id, axis);
                 tab.active = id;
                 tab.zoomed = None;
@@ -305,8 +527,13 @@ impl App {
         if self.mouse_capture == Some(id) {
             self.mouse_capture = None;
         }
-        let Some(index) = self.tabs.iter().position(|t| t.panes().contains(&id)) else { return };
-        let tab = &mut self.tabs[index];
+        let found = self
+            .windows
+            .iter()
+            .enumerate()
+            .find_map(|(w, win)| win.tabs.iter().position(|t| t.panes().contains(&id)).map(|index| (w, index)));
+        let Some((win, index)) = found else { return };
+        let tab = &mut self.windows[win].tabs[index];
         if tab.zoomed == Some(id) {
             tab.zoomed = None;
         }
@@ -322,55 +549,82 @@ impl App {
                 tab.root = root;
             }
             None => {
-                self.tabs.remove(index);
-                if index < self.current || self.current >= self.tabs.len() {
-                    self.current = self.current.saturating_sub(1);
-                }
+                self.remove_tab(win, index);
             }
         }
     }
 
-    fn close_tab(&mut self, index: usize) {
-        for id in self.tabs[index].panes() {
+    fn close_tab(&mut self, win: usize, index: usize) {
+        for id in self.windows[win].tabs[index].panes() {
             self.close_pane(id);
+        }
+    }
+
+    fn close_window_tabs(&mut self, win: usize) {
+        while !self.windows[win].tabs.is_empty() {
+            self.close_tab(win, 0);
         }
     }
 
     fn run(&mut self, action: Action) {
         if action != Action::Autocomplete {
-            self.autocomplete.close();
+            self.w_mut().autocomplete.close();
         }
         match action {
             Action::NewTab => self.new_tab(),
+            Action::NewWindow => self.new_window(),
+            Action::EditTabTitle => {
+                let w = self.w();
+                if let Some(tab) = w.tabs.get(w.current) {
+                    let (current, title) = (w.current, self.tab_title(tab));
+                    self.w_mut().tab_bar.start_rename(current, title);
+                }
+            }
+            Action::MoveTabLeft => {
+                let current = self.w().current;
+                if current > 0 {
+                    self.move_tab(current, current - 1);
+                }
+            }
+            Action::MoveTabRight => {
+                let current = self.w().current;
+                self.move_tab(current, current + 1);
+            }
+            Action::MoveTabToNewWindow => self.detach_tab(self.win, self.w().current, None),
+            Action::MergeAllWindows => self.merge_all_windows(),
             Action::ClosePane => {
-                if let Some(id) = self.tabs.get(self.current).map(|t| t.active) {
+                if let Some(id) = self.active_id() {
                     self.close_pane(id);
                 }
             }
             Action::Split(axis) => self.split(axis),
             Action::Focus(dir) => {
-                if let Some(tab) = self.tabs.get_mut(self.current)
+                let w = self.w_mut();
+                if let Some(tab) = w.tabs.get_mut(w.current)
                     && let Some(id) = layout::neighbor(&tab.rects, tab.active, dir)
                 {
                     tab.active = id;
                 }
             }
             Action::SelectTab(i) => {
-                if i < self.tabs.len() {
-                    self.current = i;
+                let w = self.w_mut();
+                if i < w.tabs.len() {
+                    w.current = i;
                 }
             }
-            Action::NextTab if !self.tabs.is_empty() => self.current = (self.current + 1) % self.tabs.len(),
-            Action::PrevTab if !self.tabs.is_empty() => {
-                self.current = (self.current + self.tabs.len() - 1) % self.tabs.len();
+            Action::NextTab | Action::PrevTab => {
+                let w = self.w_mut();
+                let n = w.tabs.len();
+                if n > 0 {
+                    w.current = if action == Action::NextTab { (w.current + 1) % n } else { (w.current + n - 1) % n };
+                }
             }
-            Action::NextTab | Action::PrevTab => {}
             Action::Copy => {
                 if let Some(text) = self.active_pane().and_then(|p| p.engine().term.selection_to_string()) {
                     self.ctx.copy_text(text);
                 }
             }
-            Action::Paste => self.ctx.send_viewport_cmd(ViewportCommand::RequestPaste),
+            Action::Paste => self.ctx.send_viewport_cmd_to(self.w().viewport, ViewportCommand::RequestPaste),
             Action::PrevPrompt => self.jump_to_prompt(true),
             Action::NextPrompt => self.jump_to_prompt(false),
             Action::ScrollPageUp => self.scroll_active(Scroll::PageUp),
@@ -386,22 +640,22 @@ impl App {
                 }
             }
             Action::OpenSettings => self.settings.open_with(&self.config),
-            Action::Find => self.find.open(),
+            Action::Find => self.w_mut().find.open(),
             Action::Autocomplete => {
-                let active = self.tabs.get(self.current).map(|t| t.active);
-                if let Some(id) = active
+                if let Some(id) = self.active_id()
                     && let Some(pane) = self.panes.get(&id)
                 {
                     let mut engine = pane.engine();
                     engine.term.scroll_display(Scroll::Bottom);
-                    self.autocomplete.start(id, &engine);
+                    self.windows[self.win].autocomplete.start(id, &engine);
                 }
             }
-            Action::FindNext | Action::FindPrevious if !self.find.open => self.find.open(),
+            Action::FindNext | Action::FindPrevious if !self.w().find.open => self.w_mut().find.open(),
             Action::FindNext => self.find_step(false),
             Action::FindPrevious => self.find_step(true),
             Action::MaximizePane => {
-                if let Some(tab) = self.tabs.get_mut(self.current) {
+                let w = self.w_mut();
+                if let Some(tab) = w.tabs.get_mut(w.current) {
                     tab.zoomed = match tab.zoomed {
                         Some(_) => None,
                         None if tab.panes().len() > 1 => Some(tab.active),
@@ -417,21 +671,21 @@ impl App {
     fn autocomplete_key(&mut self, key: Key, modifiers: Modifiers) -> bool {
         let plain = !modifiers.ctrl && !modifiers.alt;
         match key {
-            Key::Escape if plain => self.autocomplete.close(),
+            Key::Escape if plain => self.w_mut().autocomplete.close(),
             Key::Enter | Key::Tab if plain => self.accept_completion(None),
-            Key::ArrowUp if plain => self.autocomplete.move_selection(-1),
-            Key::ArrowDown if plain => self.autocomplete.move_selection(1),
-            Key::PageUp if plain => self.autocomplete.move_selection(-10),
-            Key::PageDown if plain => self.autocomplete.move_selection(10),
+            Key::ArrowUp if plain => self.w_mut().autocomplete.move_selection(-1),
+            Key::ArrowDown if plain => self.w_mut().autocomplete.move_selection(1),
+            Key::PageUp if plain => self.w_mut().autocomplete.move_selection(-10),
+            Key::PageDown if plain => self.w_mut().autocomplete.move_selection(10),
             // With no filter left, Backspace closes the popup and edits the shell line.
-            Key::Backspace if plain => return self.autocomplete.backspace(),
+            Key::Backspace if plain => return self.w_mut().autocomplete.backspace(),
             _ => {
                 let mode = self.active_pane().map(|p| *p.engine().term.mode()).unwrap_or(TermMode::empty());
                 // Printable keys arrive again as Event::Text, which filters the list.
                 if plain && input::key_bytes(key, modifiers, mode).is_none() {
                     return true;
                 }
-                self.autocomplete.close();
+                self.w_mut().autocomplete.close();
                 return false;
             }
         }
@@ -439,8 +693,9 @@ impl App {
     }
 
     fn accept_completion(&mut self, index: Option<usize>) {
-        let pane_id = self.autocomplete.pane();
-        if let Some(bytes) = self.autocomplete.accept(index)
+        let autocomplete = &mut self.windows[self.win].autocomplete;
+        let pane_id = autocomplete.pane();
+        if let Some(bytes) = autocomplete.accept(index)
             && let Some(pane) = self.panes.get(&pane_id)
         {
             pane.input(&bytes);
@@ -449,12 +704,11 @@ impl App {
 
     /// Moves to the previous (up) or next (down) find match and scrolls to it.
     fn find_step(&mut self, up: bool) {
-        if !self.find.step(up) {
+        if !self.w_mut().find.step(up) {
             return;
         }
-        let active = self.tabs.get(self.current).map(|t| t.active);
-        if let Some(pane) = active.and_then(|id| self.panes.get(&id)) {
-            self.find.reveal(&mut pane.engine());
+        if let Some(pane) = self.active_id().and_then(|id| self.panes.get(&id)) {
+            self.windows[self.win].find.reveal(&mut pane.engine());
         }
     }
 
@@ -486,6 +740,10 @@ impl App {
     }
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
+        // The inline tab title editor gets all typing.
+        if self.w().tab_bar.renaming() {
+            return;
+        }
         let events = ctx.input(|i| i.events.clone());
         // egui sends Key and then Text for the same key press; drop the Text when the key
         // was already handled (shortcuts, Alt+letter).
@@ -494,7 +752,7 @@ impl App {
             match event {
                 Event::Key { key, pressed: true, modifiers, .. } => {
                     swallow_text = false;
-                    if self.autocomplete.open && self.autocomplete_key(key, modifiers) {
+                    if self.w().autocomplete.open && self.autocomplete_key(key, modifiers) {
                         continue;
                     }
                     if let Some(action) = self.bindings.lookup(key, modifiers) {
@@ -502,11 +760,11 @@ impl App {
                         swallow_text = true;
                         continue;
                     }
-                    if self.find.open {
+                    if self.w().find.open {
                         // The find field gets typing; only its own keys are handled here.
                         let plain = !modifiers.ctrl && !modifiers.alt;
                         match key {
-                            Key::Escape if plain => self.find.close(),
+                            Key::Escape if plain => self.w_mut().find.close(),
                             Key::Enter if plain => self.find_step(!modifiers.shift),
                             Key::V if modifiers.ctrl && !modifiers.alt => {
                                 ctx.send_viewport_cmd(ViewportCommand::RequestPaste);
@@ -523,11 +781,12 @@ impl App {
                     }
                 }
                 Event::Text(text) => {
-                    if std::mem::take(&mut swallow_text) || self.find.open {
+                    if std::mem::take(&mut swallow_text) || self.w().find.open {
                         continue;
                     }
                     // While the popup is open, typing narrows the suggestions.
-                    if self.autocomplete.open && self.autocomplete.type_text(&text) {
+                    let autocomplete = &mut self.windows[self.win].autocomplete;
+                    if autocomplete.open && autocomplete.type_text(&text) {
                         continue;
                     }
                     if let Some(pane) = self.active_pane() {
@@ -535,10 +794,10 @@ impl App {
                     }
                 }
                 Event::Paste(text) => {
-                    if self.find.open {
+                    if self.w().find.open {
                         continue;
                     }
-                    self.autocomplete.close();
+                    self.w_mut().autocomplete.close();
                     if let Some(pane) = self.active_pane() {
                         let mode = *pane.engine().term.mode();
                         pane.input(&input::paste_bytes(&text, mode));
@@ -550,14 +809,7 @@ impl App {
     }
 
     fn pane_title(&self, id: PaneId) -> String {
-        let Some(pane) = self.panes.get(&id) else { return "rterm".to_owned() };
-        pane.osc_title().filter(|t| !t.is_empty()).unwrap_or_else(|| {
-            let dir = pane.working_dir().map(|d| short_path(&d)).unwrap_or_else(|| "shell".to_owned());
-            match pane.foreground_process() {
-                Some(process) => format!("{process} — {dir}"),
-                None => dir,
-            }
-        })
+        self.panes.get(&id).map(pane_title).unwrap_or_else(|| "rterm".to_owned())
     }
 
     fn style<'a>(&self, palette: &'a Palette, cell: Vec2, row_height: f32) -> Style<'a> {
@@ -711,7 +963,7 @@ impl App {
         let canvas = ui.interact(area, canvas_id, Sense::click_and_drag());
         // Keep keyboard focus on the terminal so egui never uses Tab/arrows/Esc for widget
         // navigation; the find bar's text field takes it while open.
-        if !self.find.open {
+        if !self.w().find.open && !self.w().tab_bar.renaming() {
             ui.memory_mut(|m| {
                 m.request_focus(canvas_id);
                 m.set_focus_lock_filter(
@@ -721,7 +973,8 @@ impl App {
             });
         }
 
-        let tab = self.tabs.get_mut(self.current)?;
+        let w = &mut self.windows[self.win];
+        let tab = w.tabs.get_mut(w.current)?;
         let mut leaves = Vec::new();
         match tab.zoomed.filter(|z| self.panes.contains_key(z)) {
             Some(z) => leaves.push((z, area)),
@@ -751,13 +1004,13 @@ impl App {
         if pressed
             && canvas.hovered()
             && let Some((id, _)) = ui.input(|i| i.pointer.interact_pos()).and_then(pane_at)
-            && let Some(tab) = self.tabs.get_mut(self.current)
         {
-            tab.active = id;
+            let w = self.w_mut();
+            w.tabs[w.current].active = id;
         }
 
         if pressed && canvas.hovered() {
-            self.autocomplete.close();
+            self.w_mut().autocomplete.close();
         }
         let reporting = self.handle_mouse_reporting(ui, &rects, cell);
         let modifiers = ui.input(|i| i.modifiers);
@@ -862,12 +1115,13 @@ impl App {
         }
 
         // Refresh find matches for the active pane and keep the current match in view.
-        if self.find.open
+        let w = &mut self.windows[self.win];
+        if w.find.open
             && let Some(pane) = self.panes.get(&active)
         {
             let mut engine = pane.engine();
-            if self.find.update(active, &engine) {
-                self.find.reveal(&mut engine);
+            if w.find.update(active, &engine) {
+                w.find.reveal(&mut engine);
             }
             ui.ctx().request_repaint_after(Duration::from_millis(300));
         }
@@ -877,6 +1131,7 @@ impl App {
         let style = self.style(&palette, cell, row_height);
         let window_focused = ui.input(|i| i.focused);
         let mut title_actions = Vec::new();
+        let w = &mut self.windows[self.win];
         for &(id, body, title) in &bodies {
             let Some(pane) = self.panes.get_mut(&id) else { continue };
             let (cols, rows) = render::grid_size(body, cell);
@@ -907,8 +1162,8 @@ impl App {
                 },
                 corners,
                 link: link_hover.as_ref().filter(|(lid, _, _)| *lid == id).map(|(_, span, _)| *span),
-                search: (self.find.open && id == active)
-                    .then(|| render::SearchView { matches: &self.find.matches, current: self.find.current }),
+                search: (w.find.open && id == active)
+                    .then(|| render::SearchView { matches: &w.find.matches, current: w.find.current }),
             };
             {
                 let mut engine = pane.engine();
@@ -920,12 +1175,11 @@ impl App {
                     let cursor = engine.term.grid().cursor.point;
                     let row = cursor.line.0 + engine.term.grid().display_offset() as i32;
                     let origin = render::grid_rect(body).min;
-                    self.cursor_anchor =
-                        Some(origin + vec2(cursor.column.0 as f32 * cell.x, (row + 1) as f32 * cell.y));
+                    w.cursor_anchor = Some(origin + vec2(cursor.column.0 as f32 * cell.x, (row + 1) as f32 * cell.y));
                 }
             }
             if let Some(title_rect) = title {
-                let text = self.pane_title(id);
+                let text = pane_title(pane);
                 if let Some(a) =
                     chrome::pane_title(ui, title_rect, id, &text, id == active, &self.chrome, &self.bindings)
                 {
@@ -933,33 +1187,36 @@ impl App {
                 }
             }
         }
-        if self.find.open
+        let w = &mut self.windows[self.win];
+        if w.find.open
             && let Some(&(_, body, _)) = bodies.iter().find(|(id, _, _)| *id == active)
         {
             let anchor = pos2(body.max.x - 12.0, body.min.y + 8.0);
-            match chrome::find_bar(ui.ctx(), anchor, &mut self.find, &self.chrome) {
+            match chrome::find_bar(ui.ctx(), anchor, &mut w.find, &self.chrome) {
                 Some(chrome::FindBarAction::Previous) => self.find_step(true),
                 Some(chrome::FindBarAction::Next) => self.find_step(false),
-                Some(chrome::FindBarAction::Close) => self.find.close(),
+                Some(chrome::FindBarAction::Close) => w.find.close(),
                 None => {}
             }
         }
-        if self.autocomplete.open {
-            if self.autocomplete.pane() != active {
-                self.autocomplete.close();
-            } else if let Some(anchor) = self.cursor_anchor {
+        let w = &mut self.windows[self.win];
+        if w.autocomplete.open {
+            if w.autocomplete.pane() != active {
+                w.autocomplete.close();
+            } else if let Some(anchor) = w.cursor_anchor {
                 let font_size = self.font_size;
-                if let Some(i) = self.autocomplete.show(ui.ctx(), anchor, cell.y, font_size, &self.chrome) {
+                if let Some(i) = w.autocomplete.show(ui.ctx(), anchor, cell.y, font_size, &self.chrome) {
                     self.accept_completion(Some(i));
                 }
             }
         }
         for (id, a) in title_actions {
+            let w = self.w_mut();
             match a {
-                PaneTitleAction::Focus => self.tabs[self.current].active = id,
+                PaneTitleAction::Focus => w.tabs[w.current].active = id,
                 PaneTitleAction::Close => self.close_pane(id),
                 PaneTitleAction::Menu(action) => {
-                    self.tabs[self.current].active = id;
+                    w.tabs[w.current].active = id;
                     menu_action = Some(action);
                 }
             }
@@ -968,25 +1225,76 @@ impl App {
     }
 
     fn tab_infos(&self) -> Vec<TabInfo> {
-        self.tabs
+        let w = self.w();
+        w.tabs
             .iter()
             .enumerate()
             .map(|(i, tab)| {
                 let ids = tab.panes();
                 TabInfo {
-                    title: self.pane_title(tab.active),
-                    active: i == self.current,
-                    activity: i != self.current
+                    title: self.tab_title(tab),
+                    active: i == w.current,
+                    activity: i != w.current
                         && ids.iter().any(|id| self.panes.get(id).is_some_and(|p| p.bell.load(Ordering::Relaxed))),
                     panes: ids.len(),
                     shortcut: self.bindings.label(Action::SelectTab(i)),
+                    color: tab.color,
                 }
             })
             .collect()
     }
 
+    /// Names of the other windows for the tab menu's Move Tab to Window, with their indexes.
+    fn other_windows(&self) -> (Vec<String>, Vec<usize>) {
+        (0..self.windows.len())
+            .filter(|&i| i != self.win && !self.windows[i].tabs.is_empty())
+            .map(|i| {
+                let w = &self.windows[i];
+                (format!("Window {}: {}", i + 1, self.tab_title(&w.tabs[w.current])), i)
+            })
+            .unzip()
+    }
+
+    fn tab_bar_action(&mut self, action: TabBarAction, windows: &[usize]) {
+        let win = self.win;
+        match action {
+            TabBarAction::Select(i) => self.w_mut().current = i,
+            TabBarAction::Close(i) => self.close_tab(win, i),
+            TabBarAction::New => self.new_tab(),
+            TabBarAction::Move { from, to } => self.move_tab(from, to),
+            TabBarAction::DragOut { index, pos } => self.drop_tab_outside(win, index, pos),
+            TabBarAction::Rename(i, title) => {
+                let title = title.trim();
+                if let Some(tab) = self.w_mut().tabs.get_mut(i) {
+                    tab.title = (!title.is_empty()).then(|| title.to_owned());
+                }
+            }
+            TabBarAction::Color(i, color) => {
+                if let Some(tab) = self.w_mut().tabs.get_mut(i) {
+                    tab.color = color;
+                }
+            }
+            TabBarAction::ToNewWindow(i) => self.detach_tab(win, i, None),
+            TabBarAction::ToWindow(i, w) => self.move_tab_to_window(win, i, windows[w]),
+            TabBarAction::CloseOthers(i) => {
+                let keep = self.w().tabs[i].id;
+                while let Some(index) = self.w().tabs.iter().position(|t| t.id != keep) {
+                    self.close_tab(win, index);
+                }
+            }
+            TabBarAction::CloseToRight(i) => {
+                while self.w().tabs.len() > i + 1 {
+                    self.close_tab(win, i + 1);
+                }
+            }
+            TabBarAction::MergeAllWindows => self.merge_all_windows(),
+        }
+    }
+
     fn run_script(&mut self, ctx: &egui::Context) {
         let Some(script) = self.script.as_mut() else { return };
+        // Scripted actions go to the focused window, like keyboard shortcuts.
+        self.win = self.focused_win.min(self.windows.len() - 1);
         for effect in script.tick(ctx) {
             match effect {
                 script::Effect::Action(a) => self.run(a),
@@ -996,10 +1304,23 @@ impl App {
                     }
                 }
                 script::Effect::SettingsPage(page) => self.settings.set_page(&page),
-                script::Effect::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
+                script::Effect::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
             }
         }
     }
+}
+
+fn pane_title(pane: &Pane) -> String {
+    pane.osc_title().filter(|t| !t.is_empty()).unwrap_or_else(|| {
+        let dir = pane.working_dir().map(|d| short_path(&d)).unwrap_or_else(|| "shell".to_owned());
+        match pane.foreground_process() {
+            Some(process) => format!("{process} — {dir}"),
+            None => dir,
+        }
+    })
 }
 
 fn mtime(path: &Path) -> Option<SystemTime> {
@@ -1102,9 +1423,73 @@ impl eframe::App for App {
         for id in exited {
             self.close_pane(id);
         }
+        // Closing the main window closes only its tabs while other windows are open.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting && self.windows.len() > 1 {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            self.close_window_tabs(0);
+        }
+        self.prune_windows(&ctx);
+        if self.windows[0].tabs.is_empty() {
+            return;
+        }
+
+        self.window_ui(0, ui);
+        for i in 1..self.windows.len() {
+            let w = &self.windows[i];
+            let mut builder = window_builder(&self.config, self.icon.clone()).with_inner_size(if w.sized >= 3 {
+                w.size
+            } else {
+                default_window_size(&self.config)
+            });
+            if let Some(pos) = w.position {
+                builder = builder.with_position(pos);
+            }
+            ctx.show_viewport_immediate(w.viewport, builder, |ui, _| self.window_ui(i, ui));
+        }
+
+        // A dropped tab that no window claimed opens in a new window.
+        if let Some(drop) = &self.pending_drop {
+            let left = drop.deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                let drop = self.pending_drop.take().expect("checked above");
+                if let Some((win, index)) = self.find_tab(drop.tab) {
+                    self.detach_tab(win, index, None);
+                }
+            } else {
+                ctx.request_repaint_after(left);
+            }
+        }
+        self.show_settings(&ctx);
+    }
+}
+
+impl App {
+    /// One window's frame: keyboard, chrome and panes. Runs inside the window's own viewport.
+    fn window_ui(&mut self, index: usize, ui: &mut Ui) {
+        self.win = index;
+        let ctx = ui.ctx().clone();
+        let viewport = self.w().viewport;
+        if viewport != ViewportId::ROOT && ctx.input(|i| i.viewport().close_requested()) {
+            self.close_window_tabs(index);
+            ctx.request_repaint_of(ViewportId::ROOT);
+        }
+        if self.w().tabs.is_empty() {
+            return;
+        }
+        // A tab dropped outside its window (position unknown) lands in the window the pointer enters.
+        if let Some(drop) = &self.pending_drop
+            && drop.source != viewport
+            && ctx.input(|i| i.pointer.hover_pos().is_some())
+        {
+            let drop = self.pending_drop.take().expect("checked above");
+            if let Some((win, tab)) = self.find_tab(drop.tab) {
+                self.move_tab_to_window(win, tab, index);
+            }
+        }
+
         self.handle_keyboard(&ctx);
-        if self.tabs.is_empty() {
-            ctx.send_viewport_cmd(ViewportCommand::Close);
+        let w = self.w();
+        if w.tabs.is_empty() {
             return;
         }
 
@@ -1113,11 +1498,24 @@ impl eframe::App for App {
         let cell = vec2(glyph_w, (row_h * self.config.font.line_height).round());
 
         let iterm = self.config.window.decorations == Decorations::Iterm;
-        let (maximized, fullscreen, focused) = ctx.input(|i| {
+        let (maximized, fullscreen, focused, inner_rect, outer_rect) = ctx.input(|i| {
             let v = i.viewport();
-            (v.maximized.unwrap_or(false), v.fullscreen.unwrap_or(false), v.focused.unwrap_or(true))
+            (
+                v.maximized.unwrap_or(false),
+                v.fullscreen.unwrap_or(false),
+                v.focused.unwrap_or(true),
+                v.inner_rect,
+                v.outer_rect,
+            )
         });
+        if ctx.input(|i| i.viewport().focused) == Some(true) {
+            self.focused_win = index;
+        }
         let window = ui.max_rect();
+        let w = self.w_mut();
+        w.size = window.size();
+        w.inner_rect = inner_rect;
+        w.outer_rect = outer_rect;
         let radius = if iterm && !maximized && !fullscreen {
             self.config.window.corner_radius.clamp(0.0, 30.0) as u8
         } else {
@@ -1126,14 +1524,20 @@ impl eframe::App for App {
         let painter = ui.painter().clone();
         painter.rect_filled(window, radius, if iterm { self.chrome.window } else { self.palette.bg });
 
-        let show_tabs = self.tabs.len() > 1 || self.config.window.show_tab_bar_with_one_tab;
+        let w = self.w();
+        // With several windows open, every window shows its tabs so they can be dragged between them.
+        let show_tabs = w.tabs.len() > 1
+            || self.windows.len() > 1
+            || self.config.window.show_tab_bar_with_one_tab
+            || w.tab_bar.renaming();
         let chrome_h =
             if iterm { chrome::TITLE_BAR_HEIGHT } else { 0.0 } + if show_tabs { chrome::TAB_BAR_HEIGHT } else { 0.0 };
 
         // Size the window to columns x rows once real metrics are known.
-        if self.sized_window < 3 {
-            self.sized_window += 1;
-            if self.sized_window == 3 {
+        let w = &mut self.windows[index];
+        if w.sized < 3 {
+            w.sized += 1;
+            if w.sized == 3 {
                 let size = render::pane_size_for(self.config.window.columns, self.config.window.rows, cell)
                     + vec2(0.0, chrome_h);
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
@@ -1141,16 +1545,20 @@ impl eframe::App for App {
         }
 
         let mut y = window.min.y;
-        let title = self.pane_title(self.tabs[self.current].active);
+        let active = w.tabs[w.current].active;
+        let title = self.pane_title(active);
         if iterm {
             let r = Rect::from_min_max(window.min, pos2(window.max.x, y + chrome::TITLE_BAR_HEIGHT));
             chrome::title_bar(ui, r, &title, &self.chrome, focused, maximized);
             y = r.max.y;
         }
         let mut tab_action = None;
+        let (window_names, window_indexes) = self.other_windows();
         if show_tabs {
             let r = Rect::from_min_max(pos2(window.min.x, y), pos2(window.max.x, y + chrome::TAB_BAR_HEIGHT));
-            tab_action = chrome::tab_bar(ui, r, &self.tab_infos(), &self.chrome, iterm);
+            let infos = self.tab_infos();
+            let w = &mut self.windows[index];
+            tab_action = chrome::tab_bar(ui, r, &infos, &window_names, &mut w.tab_bar, &self.chrome, iterm);
             y = r.max.y;
         }
         if iterm && chrome_h > 0.0 {
@@ -1168,22 +1576,18 @@ impl eframe::App for App {
         if !iterm {
             ctx.send_viewport_cmd(ViewportCommand::Title(title));
         }
-        self.draw_notice(ui, content);
+        if index == self.focused_win {
+            self.draw_notice(ui, content);
+        }
 
-        match tab_action {
-            Some(TabBarAction::Select(i)) => self.current = i,
-            Some(TabBarAction::Close(i)) => self.close_tab(i),
-            Some(TabBarAction::New) => self.new_tab(),
-            None => {}
+        if let Some(action) = tab_action {
+            self.tab_bar_action(action, &window_indexes);
         }
         if let Some(action) = menu_action {
             self.run(action);
         }
-        self.show_settings(&ctx);
     }
-}
 
-impl App {
     fn show_settings(&mut self, ctx: &egui::Context) {
         if self.settings.open {
             let env = settings::Env {
@@ -1196,16 +1600,18 @@ impl App {
                 let old_decorations = self.config.window.decorations;
                 self.config = self.settings.draft.clone();
                 if self.config.window.decorations != old_decorations {
-                    ctx.send_viewport_cmd(ViewportCommand::Decorations(
-                        self.config.window.decorations == Decorations::System,
-                    ));
+                    let system = self.config.window.decorations == Decorations::System;
+                    for w in &self.windows {
+                        ctx.send_viewport_cmd_to(w.viewport, ViewportCommand::Decorations(system));
+                    }
                 }
                 self.apply_config();
                 self.save_due = Some(Instant::now() + Duration::from_millis(400));
             }
             if out.resize_window {
                 // Re-run the one-shot columns x rows sizing on the next frame.
-                self.sized_window = 2;
+                let focused = self.focused_win.min(self.windows.len() - 1);
+                self.windows[focused].sized = 2;
             }
         }
         if let Some(due) = self.save_due {

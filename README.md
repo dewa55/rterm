@@ -50,7 +50,7 @@ The default appearance follows iTerm2 3.6/3.7 on macOS Tahoe:
 - A capsule tab bar: tabs stretch to fill it, the active tab is a raised pill, each tab shows its
   shortcut, and a round `+` button sits at the end. A close button appears on hover, and a blue dot
   marks a background tab that rang the bell. The bar is hidden while only one tab is open, as in
-  iTerm2.
+  iTerm2, unless several windows are open (so every tab can be dragged to another window).
 - Per-pane title bars on split panes (close button, title, ☰ menu), 1px dividers, and inactive
   panes dimmed toward grey.
 - iTerm2's default **Regular** color preset (background `#15191f`, selection `#b3d7ff`).
@@ -63,6 +63,20 @@ Set `decorations = "system"` for the native GNOME title bar instead.
 
 - **Tabs and split panes**, nested in any combination. Drag a divider to resize; maximize a single
   pane with Ctrl+Shift+Enter.
+- **Multiple windows in one process** (Ctrl+Shift+N). Tabs can be:
+  - reordered by dragging them along the tab bar, or with Ctrl+Shift+PageUp / PageDown
+  - dragged out of the window to open in a window of their own, or dropped on another rterm window
+    to move there
+  - renamed by double-clicking them, with Ctrl+Shift+I, or from the tab's right-click menu
+    (an empty title goes back to the automatic one)
+  - colored from the right-click menu, which also has Move Tab to New Window, Move Tab to Window,
+    Merge All Windows, Close Tabs to the Right and Close Other Tabs, as in iTerm2.
+    Merge All Windows is also in the terminal's right-click menu.
+
+  Closing the first window while others are open keeps the app running: that window takes over
+  the tabs of another one. On Wayland, where windows can't see each other's positions, a tab
+  dropped outside its window joins the rterm window the pointer is over when the button is
+  released, and otherwise opens a new window wherever the compositor places it.
 - **Shell integration** compatible with iTerm2/FinalTerm escape codes:
   - Prompt marks in the gutter: grey = prompt, blue = running, green = exit 0, red = failed
   - Jump to the previous/next prompt
@@ -88,7 +102,8 @@ Set `decorations = "system"` for the native GNOME title bar instead.
   - Keep typing to narrow the list. Up/Down choose, Enter or Tab inserts, Esc closes.
   - Smart case: lowercase input matches any case.
 - **Links**: Ctrl+hover underlines a URL or an OSC 8 hyperlink, and Ctrl+click opens it.
-- **Right-click menu**: Copy, Paste, Find, Split, Maximize Pane, New Tab, Clear Buffer, Close.
+- **Right-click menu**: Copy, Paste, Find, Split, Maximize Pane, New Tab, New Window, Clear Buffer,
+  Close.
   Middle-click pastes.
 - Bracketed paste, synchronized updates, xterm-256color and truecolor, OSC 52 copy.
 
@@ -100,6 +115,9 @@ All of them can be changed under `[keys]` in the config.
 | Action | Keys |
 |---|---|
 | New tab | Ctrl+Shift+T |
+| New window | Ctrl+Shift+N |
+| Edit tab title | Ctrl+Shift+I |
+| Move tab left / right | Ctrl+Shift+PageUp / Ctrl+Shift+PageDown |
 | Close pane (closes the tab with its last pane) | Ctrl+Shift+W |
 | Split vertically (side by side) / horizontally (stacked) | Ctrl+Shift+D / Ctrl+Shift+E |
 | Maximize / restore the active pane | Ctrl+Shift+Enter |
@@ -157,7 +175,7 @@ itermcolors = "~/Downloads/Dracula.itermcolors"
 preset = "Solarized Dark"
 
 [keys]
-"ctrl+shift+n" = "new_tab"
+"ctrl+shift+y" = "new_tab"
 "alt+1" = "none"              # give Alt+1 back to the shell
 ```
 
@@ -225,7 +243,9 @@ RTERM_SCRIPT='sleep 1;;type ls\n;;split_vertical;;sleep 1;;screenshot /tmp/rterm
 
 Running under `xvfb-run` keeps test windows off your desktop. It also avoids stalls: GNOME stops
 painting windows that open behind others. `RTERM_EMBED_VIEWPORTS=1` draws the Settings window
-inside the main one so it can be captured too.
+inside the main one so it can be captured too. `screenshot` captures only the first window, and
+synthetic mouse input goes to it; to see other windows, grab the whole Xvfb screen (for example
+with Pillow's `ImageGrab.grab()`). Scripted actions apply to the most recently focused window.
 
 ## Missing compared to iTerm2
 
@@ -237,9 +257,6 @@ Roughly in order of how much they are missed day to day:
   by host or directory.
 - **Session restore and window arrangements**: tabs and splits are not saved or restored after a
   restart.
-- **Multiple windows in one app**: each window is a separate process with no New Window shortcut.
-  Tabs cannot be dragged between windows, reordered by dragging, renamed, colored, or turned into
-  their own window.
 - **Hotkey window**: no system-wide drop-down terminal (Wayland requires a desktop-specific
   global-shortcut portal).
 - **Copy mode**: no keyboard-driven, vi-style selection.

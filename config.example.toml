@@ -47,10 +47,11 @@ mouse_reporting = true            # hold Shift to select text in apps that grab 
 
 [keys]
 # Override or add bindings; "none" passes the key through to the shell.
-# Actions: new_tab close_pane split_vertical split_horizontal focus_left focus_right focus_up
+# Actions: new_tab new_window edit_tab_title move_tab_left move_tab_right move_tab_to_new_window
+#   merge_all_windows close_pane split_vertical split_horizontal focus_left focus_right focus_up
 #   focus_down next_tab prev_tab select_tab_1..select_tab_9 copy paste prev_prompt next_prompt
 #   scroll_page_up scroll_page_down scroll_top scroll_bottom font_bigger font_smaller font_reset
 #   clear_buffer maximize_pane open_settings find find_next find_previous
 #   autocomplete
-# "ctrl+shift+n" = "new_tab"
+# "ctrl+shift+y" = "new_tab"
 # "alt+1" = "none"

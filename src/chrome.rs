@@ -2,7 +2,7 @@
 //! capsule tab bar, per-pane title bars, and window resize edges for undecorated windows.
 
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Rect, ResizeDirection, RichText, Sense, Stroke,
+    self, Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Pos2, Rect, ResizeDirection, RichText, Sense, Stroke,
     StrokeKind, Ui, ViewportCommand, pos2, vec2,
 };
 
@@ -161,23 +161,140 @@ pub fn title_bar(ui: &Ui, rect: Rect, title: &str, colors: &ChromeColors, focuse
     painter.text(rect.center(), Align2::CENTER_CENTER, text, font, color);
 }
 
+/// Tab colors offered in the tab menu (iTerm2's ColorsMenuItemView palette).
+pub const TAB_COLORS: [(&str, Color32); 7] = [
+    ("Red", rgb(0xfb6b62)),
+    ("Orange", rgb(0xf6ac47)),
+    ("Yellow", rgb(0xf0dc4f)),
+    ("Green", rgb(0xb5d749)),
+    ("Blue", rgb(0x5fa3f8)),
+    ("Purple", rgb(0xc18ed9)),
+    ("Gray", rgb(0x787878)),
+];
+
 pub struct TabInfo {
     pub title: String,
     pub active: bool,
     pub activity: bool,
     pub panes: usize,
     pub shortcut: Option<String>,
+    pub color: Option<Color32>,
 }
 
 pub enum TabBarAction {
     Select(usize),
     Close(usize),
     New,
+    /// Reorder: live while a tab is dragged, or Move Tab Left/Right from the tab menu.
+    Move {
+        from: usize,
+        to: usize,
+    },
+    /// A dragged tab was dropped outside the window, at this window-relative position.
+    DragOut {
+        index: usize,
+        pos: Pos2,
+    },
+    Rename(usize, String),
+    Color(usize, Option<Color32>),
+    ToNewWindow(usize),
+    /// Move to the window at this index of the `windows` list given to `tab_bar`.
+    ToWindow(usize, usize),
+    CloseOthers(usize),
+    CloseToRight(usize),
+    MergeAllWindows,
 }
 
-/// Capsule tab bar; tabs stretch to fill the bar like iTerm2's default.
-pub fn tab_bar(ui: &Ui, rect: Rect, tabs: &[TabInfo], colors: &ChromeColors, draggable: bool) -> Option<TabBarAction> {
-    let painter = ui.painter();
+/// Tab bar state kept between frames: the tab being dragged and the inline title editor.
+#[derive(Default)]
+pub struct TabBarState {
+    drag: Option<TabDrag>,
+    rename: Option<(usize, String)>,
+    focus_rename: bool,
+}
+
+struct TabDrag {
+    /// Current slot of the dragged tab.
+    index: usize,
+    /// Pointer offset from the tab's left edge when the drag started.
+    grab: f32,
+    pos: Pos2,
+}
+
+impl TabBarState {
+    /// Opens the inline title editor on tab `index` (iTerm2's Edit Tab Title).
+    pub fn start_rename(&mut self, index: usize, title: String) {
+        self.rename = Some((index, title));
+        self.focus_rename = true;
+    }
+
+    pub fn renaming(&self) -> bool {
+        self.rename.is_some()
+    }
+}
+
+/// Fill and text color of a tab, tinted when it has a tab color.
+fn tab_colors(tab: &TabInfo, hovered: bool, colors: &ChromeColors) -> (Option<Color32>, Color32) {
+    let fill = match (tab.color, tab.active) {
+        (Some(c), true) => Some(colors.tab_active.lerp_to_gamma(c, 0.75)),
+        (Some(c), false) => Some(colors.tab_container.lerp_to_gamma(c, if hovered { 0.55 } else { 0.4 })),
+        (None, true) => Some(colors.tab_active),
+        (None, false) => hovered.then(|| colors.tab_active.gamma_multiply(0.35)),
+    };
+    let text = match fill.filter(|_| tab.color.is_some()) {
+        // Dark text on light tints (yellow, green) so titles stay readable.
+        Some(f) if f.r() as u32 * 299 + f.g() as u32 * 587 + f.b() as u32 * 114 > 150_000 => rgb(0x1d1d1d),
+        Some(_) => rgb(0xf4f4f4),
+        None if tab.active => colors.tab_text,
+        None => colors.tab_text_inactive,
+    };
+    (fill, text)
+}
+
+/// Draws a tab's pill (if any) and centered title; returns the text color.
+fn paint_tab(painter: &egui::Painter, r: Rect, tab: &TabInfo, hovered: bool, colors: &ChromeColors) -> Color32 {
+    let (fill, text_color) = tab_colors(tab, hovered, colors);
+    if let Some(fill) = fill {
+        let pill = r.shrink(2.0);
+        let radius = CornerRadius::same((pill.height() / 2.0) as u8);
+        painter.rect_filled(pill, radius, fill);
+        if tab.active {
+            let highlight = colors.tab_active_highlight.gamma_multiply(0.6);
+            painter.rect_stroke(pill, radius, Stroke::new(1.0, highlight), StrokeKind::Inside);
+        }
+    }
+    text_color
+}
+
+fn paint_tab_title(ui: &Ui, painter: &egui::Painter, r: Rect, tab: &TabInfo, text_color: Color32) {
+    let font = FontId::proportional(13.0);
+    let shortcut_w = if tab.shortcut.is_some() && r.width() > 140.0 { 44.0 } else { 0.0 };
+    let mut title = tab.title.clone();
+    if tab.panes > 1 {
+        title = format!("{title} ({})", tab.panes);
+    }
+    let title = fit_text(ui, &title, &font, r.width() - 44.0 - shortcut_w);
+    let y = r.center().y;
+    painter.text(pos2(r.center().x - shortcut_w / 2.0, y), Align2::CENTER_CENTER, title, font, text_color);
+    if let Some(shortcut) = tab.shortcut.as_ref().filter(|_| shortcut_w > 0.0) {
+        let small = FontId::proportional(11.5);
+        painter.text(pos2(r.max.x - 14.0, y), Align2::RIGHT_CENTER, shortcut, small, text_color.gamma_multiply(0.7));
+    }
+}
+
+/// Capsule tab bar; tabs stretch to fill the bar like iTerm2's default. Tabs can be dragged to
+/// reorder them or out of the window, renamed by double-click, and have a right-click menu.
+/// `windows` names the other windows a tab can be moved to.
+pub fn tab_bar(
+    ui: &mut Ui,
+    rect: Rect,
+    tabs: &[TabInfo],
+    windows: &[String],
+    state: &mut TabBarState,
+    colors: &ChromeColors,
+    draggable: bool,
+) -> Option<TabBarAction> {
+    let painter = ui.painter().clone();
     let mut action = None;
     if draggable {
         // Empty space in the tab bar also moves the window.
@@ -201,63 +318,107 @@ pub fn tab_bar(ui: &Ui, rect: Rect, tabs: &[TabInfo], colors: &ChromeColors, dra
     let radius = CornerRadius::same((height / 2.0) as u8);
     painter.rect_filled(container, radius, colors.tab_container);
 
-    let n = tabs.len().max(1) as f32;
-    let tab_w = container.width() / n;
-    let font = FontId::proportional(13.0);
-    let small = FontId::proportional(11.5);
-    for (i, tab) in tabs.iter().enumerate() {
-        let r = Rect::from_min_size(pos2(container.min.x + i as f32 * tab_w, container.min.y), vec2(tab_w, height));
-        let response = ui.interact(r, Id::unique(("tab", i)), Sense::click());
-        let hovered = response.hovered();
-        if tab.active {
-            let pill = r.shrink(2.0);
-            let pill_radius = CornerRadius::same((pill.height() / 2.0) as u8);
-            painter.rect_filled(pill, pill_radius, colors.tab_active);
-            painter.rect_stroke(
-                pill,
-                pill_radius,
-                Stroke::new(1.0, colors.tab_active_highlight.gamma_multiply(0.6)),
-                StrokeKind::Inside,
-            );
-        } else if hovered {
-            let pill = r.shrink(2.0);
-            painter.rect_filled(
-                pill,
-                CornerRadius::same((pill.height() / 2.0) as u8),
-                colors.tab_active.gamma_multiply(0.35),
-            );
+    let n = tabs.len().max(1);
+    let tab_w = container.width() / n as f32;
+    let slot =
+        |i: usize| Rect::from_min_size(pos2(container.min.x + i as f32 * tab_w, container.min.y), vec2(tab_w, height));
+    if state.rename.as_ref().is_some_and(|(i, _)| *i >= tabs.len()) {
+        state.rename = None;
+    }
+
+    // A dragged tab follows the pointer, reorders live while near the bar, and reports a drop
+    // outside the window so it can move to another window or become its own.
+    let band = rect.expand2(vec2(0.0, 24.0));
+    let mut order: Vec<usize> = (0..tabs.len()).collect();
+    if let Some(drag) = state.drag.as_mut() {
+        let released = ui.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, .. } => {
+                    Some(*pos)
+                }
+                _ => None,
+            })
+        });
+        if let Some(pos) = released.or_else(|| ui.input(|i| i.pointer.latest_pos())) {
+            drag.pos = pos;
         }
-        // Separators between neighbouring inactive tabs.
-        if i > 0 && !tab.active && !tabs[i - 1].active {
-            painter.vline(r.min.x, (y - 7.0)..=(y + 7.0), Stroke::new(1.0, colors.tab_separator));
+        if band.contains(drag.pos) && drag.index < tabs.len() {
+            let to = ((drag.pos.x - drag.grab - container.min.x) / tab_w + 0.5).floor().clamp(0.0, (n - 1) as f32);
+            let to = to as usize;
+            if to != drag.index {
+                let moved = order.remove(drag.index);
+                order.insert(to, moved);
+                action = Some(TabBarAction::Move { from: drag.index, to });
+                drag.index = to;
+            }
+        }
+        if released.is_some() || !ui.input(|i| i.pointer.primary_down()) {
+            if !ui.ctx().content_rect().contains(drag.pos) {
+                action = Some(TabBarAction::DragOut { index: drag.index, pos: drag.pos });
+            }
+            state.drag = None;
+        } else {
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+            ui.ctx().request_repaint();
+        }
+    }
+    let dragging = state.drag.as_ref().map(|d| d.index);
+
+    for (slot_i, &i) in order.iter().enumerate() {
+        let tab = &tabs[i];
+        let r = slot(slot_i);
+        if dragging == Some(slot_i) {
+            continue; // Drawn last, under the pointer.
+        }
+        let response = ui.interact(r, Id::unique(("tab", i)), Sense::click_and_drag());
+        let hovered = response.hovered() && dragging.is_none();
+        let text_color = paint_tab(&painter, r, tab, hovered, colors);
+        // Separators between neighbouring plain inactive tabs.
+        if slot_i > 0 {
+            let prev = &tabs[order[slot_i - 1]];
+            if !tab.active && !prev.active && tab.color.is_none() && prev.color.is_none() {
+                painter.vline(r.min.x, (y - 7.0)..=(y + 7.0), Stroke::new(1.0, colors.tab_separator));
+            }
         }
 
-        let text_color = if tab.active { colors.tab_text } else { colors.tab_text_inactive };
-        let shortcut_w = if tab.shortcut.is_some() && tab_w > 140.0 { 44.0 } else { 0.0 };
-        let mut title = tab.title.clone();
-        if tab.panes > 1 {
-            title = format!("{title} ({})", tab.panes);
-        }
-        let title = fit_text(ui, &title, &font, tab_w - 44.0 - shortcut_w);
-        painter.text(pos2(r.center().x - shortcut_w / 2.0, y), Align2::CENTER_CENTER, title, font.clone(), text_color);
-        if let Some(shortcut) = tab.shortcut.as_ref().filter(|_| shortcut_w > 0.0) {
-            painter.text(
-                pos2(r.max.x - 14.0, y),
-                Align2::RIGHT_CENTER,
-                shortcut,
-                small.clone(),
-                colors.tab_text_inactive,
-            );
+        let editing = state.rename.as_ref().is_some_and(|(ri, _)| *ri == i);
+        if editing {
+            let id = Id::unique("tab-rename");
+            if let Some((_, text)) = state.rename.as_mut() {
+                if std::mem::take(&mut state.focus_rename) {
+                    let mut edit_state = egui::text_edit::TextEditState::default();
+                    edit_state.cursor.set_char_range(Some(egui::text::CCursorRange::select_all_str(text)));
+                    edit_state.store(ui.ctx(), id);
+                    ui.memory_mut(|m| m.request_focus(id));
+                }
+                let edit = egui::TextEdit::singleline(text)
+                    .id(id)
+                    .font(FontId::proportional(13.0))
+                    .text_color(text_color)
+                    .align(Align2::CENTER_CENTER)
+                    .frame(egui::Frame::new())
+                    .margin(egui::Margin::ZERO);
+                let field = r.shrink2(vec2(30.0, 5.0));
+                let response = ui.put(field, edit);
+                painter.hline(field.x_range(), field.max.y, Stroke::new(1.0, text_color.gamma_multiply(0.5)));
+                if response.lost_focus() {
+                    let cancelled = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    if let Some((index, text)) = state.rename.take()
+                        && !cancelled
+                    {
+                        action = Some(TabBarAction::Rename(index, text));
+                    }
+                }
+            }
+        } else {
+            paint_tab_title(ui, &painter, r, tab, text_color);
         }
 
         // Close button on hover (left), activity dot otherwise.
         let close_center = pos2(r.min.x + 16.0, y);
-        if hovered || ui.rect_contains_pointer(Rect::from_center_size(close_center, vec2(18.0, 18.0))) {
-            let close = ui.interact(
-                Rect::from_center_size(close_center, vec2(18.0, 18.0)),
-                Id::unique(("tab-close", i)),
-                Sense::click(),
-            );
+        let close_rect = Rect::from_center_size(close_center, vec2(18.0, 18.0));
+        if dragging.is_none() && (hovered || ui.rect_contains_pointer(close_rect)) {
+            let close = ui.interact(close_rect, Id::unique(("tab-close", i)), Sense::click());
             if close.hovered() {
                 painter.circle_filled(close_center, 8.0, colors.tab_separator);
             }
@@ -276,6 +437,37 @@ pub fn tab_bar(ui: &Ui, rect: Rect, tabs: &[TabInfo], colors: &ChromeColors, dra
         if response.middle_clicked() {
             action = Some(TabBarAction::Close(i));
         }
+        if response.double_clicked() && !editing {
+            state.start_rename(i, tab.title.clone());
+        }
+        if response.drag_started_by(egui::PointerButton::Primary) && !editing {
+            let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(r.center());
+            state.drag = Some(TabDrag { index: slot_i, grab: origin.x - r.min.x, pos: origin });
+            action = Some(TabBarAction::Select(i));
+        }
+        response.context_menu(|ui| {
+            if let Some(a) = tab_menu(ui, i, tabs, windows, state) {
+                action = Some(a);
+            }
+        });
+    }
+
+    // The dragged tab, on top of everything (also over the terminal when dragged out of the bar).
+    if let Some(drag) = &state.drag
+        && let Some(tab) = order.get(drag.index).map(|&i| &tabs[i])
+    {
+        let r = if band.contains(drag.pos) {
+            let x = (drag.pos.x - drag.grab).clamp(container.min.x, container.max.x - tab_w);
+            Rect::from_min_size(pos2(x, container.min.y), vec2(tab_w, height))
+        } else {
+            Rect::from_min_size(pos2(drag.pos.x - drag.grab, drag.pos.y - height / 2.0), vec2(tab_w, height))
+        };
+        let layer = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, Id::unique("tab-drag")));
+        let shadow = egui::epaint::Shadow { offset: [0, 3], blur: 10, spread: 0, color: Color32::from_black_alpha(90) };
+        layer.add(shadow.as_shape(r.shrink(2.0), CornerRadius::same((height / 2.0 - 2.0) as u8)));
+        let active = TabInfo { active: true, title: tab.title.clone(), shortcut: None, ..*tab };
+        let text_color = paint_tab(&layer, r, &active, false, colors);
+        paint_tab_title(ui, &layer, r, &active, text_color);
     }
 
     let plus_rect = Rect::from_center_size(plus_center, vec2(plus_d, plus_d));
@@ -289,6 +481,96 @@ pub fn tab_bar(ui: &Ui, rect: Rect, tabs: &[TabInfo], colors: &ChromeColors, dra
         action = Some(TabBarAction::New);
     }
     action
+}
+
+/// Right-click menu of a tab, with the entries of iTerm2's tab context menu.
+fn tab_menu(
+    ui: &mut Ui,
+    i: usize,
+    tabs: &[TabInfo],
+    windows: &[String],
+    state: &mut TabBarState,
+) -> Option<TabBarAction> {
+    let item = |ui: &mut Ui, label: &str, enabled: bool| {
+        let clicked = ui.add_enabled(enabled, egui::Button::new(label)).clicked();
+        if clicked {
+            ui.close();
+        }
+        clicked
+    };
+    let mut chosen = None;
+    if item(ui, "Edit Tab Title", true) {
+        state.start_rename(i, tabs[i].title.clone());
+    }
+    ui.separator();
+    ui.label(RichText::new("Tab Color").small());
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let current = tabs[i].color;
+        let choices = std::iter::once(("Default", None)).chain(TAB_COLORS.map(|(name, c)| (name, Some(c))));
+        for (name, color) in choices {
+            if color_swatch(ui, color, current == color).on_hover_text(name).clicked() {
+                chosen = Some(TabBarAction::Color(i, color));
+                ui.close();
+            }
+        }
+    });
+    ui.separator();
+    let n = tabs.len();
+    if item(ui, "Move Tab Left", i > 0) {
+        chosen = Some(TabBarAction::Move { from: i, to: i - 1 });
+    }
+    if item(ui, "Move Tab Right", i + 1 < n) {
+        chosen = Some(TabBarAction::Move { from: i, to: i + 1 });
+    }
+    if item(ui, "Move Tab to New Window", n > 1) {
+        chosen = Some(TabBarAction::ToNewWindow(i));
+    }
+    ui.add_enabled_ui(!windows.is_empty(), |ui| {
+        ui.menu_button("Move Tab to Window", |ui| {
+            for (w, name) in windows.iter().enumerate() {
+                if item(ui, name, true) {
+                    chosen = Some(TabBarAction::ToWindow(i, w));
+                }
+            }
+        });
+    });
+    if item(ui, "Merge All Windows", !windows.is_empty()) {
+        chosen = Some(TabBarAction::MergeAllWindows);
+    }
+    ui.separator();
+    if item(ui, "Close Tabs to the Right", i + 1 < n) {
+        chosen = Some(TabBarAction::CloseToRight(i));
+    }
+    if item(ui, "Close Other Tabs", n > 1) {
+        chosen = Some(TabBarAction::CloseOthers(i));
+    }
+    if item(ui, "Close Tab", true) {
+        chosen = Some(TabBarAction::Close(i));
+    }
+    chosen
+}
+
+/// A round color swatch for the tab color picker; `None` is "no color" (a slashed circle).
+fn color_swatch(ui: &mut Ui, color: Option<Color32>, selected: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::click());
+    let c = rect.center();
+    let painter = ui.painter();
+    let ring = ui.visuals().text_color();
+    if selected || response.hovered() {
+        painter.circle_stroke(c, 9.5, Stroke::new(1.5, ring.gamma_multiply(if selected { 1.0 } else { 0.5 })));
+    }
+    match color {
+        Some(color) => {
+            painter.circle_filled(c, 7.0, color);
+        }
+        None => {
+            let s = Stroke::new(1.2, ring.gamma_multiply(0.7));
+            painter.circle_stroke(c, 6.5, s);
+            painter.line_segment([c + vec2(-4.5, 4.5), c + vec2(4.5, -4.5)], s);
+        }
+    }
+    response
 }
 
 pub enum PaneTitleAction {
@@ -375,6 +657,8 @@ pub fn pane_menu(ui: &mut Ui, bindings: &Bindings, has_selection: bool) -> Optio
     item(ui, "Split Pane Horizontally", Action::Split(Axis::Vertical), true);
     item(ui, "Maximize Pane", Action::MaximizePane, true);
     item(ui, "New Tab", Action::NewTab, true);
+    item(ui, "New Window", Action::NewWindow, true);
+    item(ui, "Merge All Windows", Action::MergeAllWindows, true);
     ui.separator();
     item(ui, "Clear Buffer", Action::ClearBuffer, true);
     item(ui, "Close Pane", Action::ClosePane, true);
